@@ -430,6 +430,35 @@ static CK_RV p11prov_sig_operate_init(P11PROV_SIG_CTX *sigctx, bool digest_op,
             ret = p11prov_VerifyInit(sigctx->provctx, sess, &sigctx->mechanism,
                                      handle);
         }
+        // If the key rejects PKCS1v1.5, retry with PSS. CKA_ALLOWED_MECHANISMS
+        // is sensitive on private keys, so we cannot read the restriction; the
+        // token's refusal is the only reliable signal.
+        if (ret != CKR_OK && sigctx->mechtype == CKM_RSA_PKCS) {
+            sigctx->mechtype = CKM_RSA_PKCS_PSS;
+            p11prov_rsasig_set_mechanism(sigctx);
+            p11prov_return_session(session);
+            session = NULL;
+            ret = p11prov_try_session_ref(sigctx->key,
+                                          sigctx->mechanism.mechanism,
+                                          reqlogin, false, &session);
+            if (ret == CKR_OK) {
+                sess = p11prov_session_handle(session);
+                if (sigctx->operation == CKF_SIGN) {
+                    ret = p11prov_SignInit(sigctx->provctx, sess,
+                                           &sigctx->mechanism, handle);
+                } else if (sigctx->signature) {
+                    ret = p11prov_VerifySignatureInit(
+                        sigctx->provctx, sess, &sigctx->mechanism, handle,
+                        sigctx->signature, sigctx->signature_len);
+                    if (ret == CKR_OK) {
+                        sigctx->verify_signature = true;
+                    }
+                } else {
+                    ret = p11prov_VerifyInit(sigctx->provctx, sess,
+                                             &sigctx->mechanism, handle);
+                }
+            }
+        }
         if (ret == CKR_OK) {
             sigctx->session_state = SESS_INITIALIZED;
         }

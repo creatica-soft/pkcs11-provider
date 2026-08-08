@@ -408,7 +408,7 @@ DISPATCH_RSASIG_FN(set_ctx_params);
 DISPATCH_RSASIG_FN(gettable_ctx_params);
 DISPATCH_RSASIG_FN(settable_ctx_params);
 
-static CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx)
+CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx)
 {
     const struct rsasig_data *data = NULL;
     int rv;
@@ -559,6 +559,7 @@ static void *p11prov_rsasig_newctx(void *provctx, const char *properties)
 static int p11prov_rsasig_sign_init(void *ctx, void *provkey,
                                     const OSSL_PARAM params[])
 {
+    P11PROV_SIG_CTX *sigctx = (P11PROV_SIG_CTX *)ctx;
     CK_RV ret;
 
     P11PROV_debug("rsa sign init (ctx=%p, key=%p, params=%p)", ctx, provkey,
@@ -567,6 +568,16 @@ static int p11prov_rsasig_sign_init(void *ctx, void *provkey,
     ret = p11prov_sig_op_init(ctx, provkey, CKF_SIGN, NULL);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
+    }
+
+    /* When the caller does not explicitly request a padding mode and the key
+     * is PSS-restricted (CKA_ALLOWED_MECHANISMS lists only PSS algorithms),
+     * default to PSS so the token does not reject CKM_RSA_PKCS.  The store
+     * and encoder paths already detect this via p11prov_obj_is_rsa_pss();
+     * the signature path did not. */
+    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
+        && p11prov_obj_is_rsa_pss(sigctx->key)) {
+        sigctx->mechtype = CKM_RSA_PKCS_PSS;
     }
 
     return p11prov_rsasig_set_ctx_params(ctx, params);
@@ -603,6 +614,7 @@ static int p11prov_rsasig_sign(void *ctx, unsigned char *sig, size_t *siglen,
 static int p11prov_rsasig_verify_init(void *ctx, void *provkey,
                                       const OSSL_PARAM params[])
 {
+    P11PROV_SIG_CTX *sigctx = (P11PROV_SIG_CTX *)ctx;
     CK_RV ret;
 
     P11PROV_debug("rsa verify init (ctx=%p, key=%p, params=%p)", ctx, provkey,
@@ -611,6 +623,11 @@ static int p11prov_rsasig_verify_init(void *ctx, void *provkey,
     ret = p11prov_sig_op_init(ctx, provkey, CKF_VERIFY, NULL);
     if (ret != CKR_OK) {
         return RET_OSSL_ERR;
+    }
+
+    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
+        && p11prov_obj_is_rsa_pss(sigctx->key)) {
+        sigctx->mechtype = CKM_RSA_PKCS_PSS;
     }
 
     return p11prov_rsasig_set_ctx_params(ctx, params);
@@ -654,6 +671,11 @@ static int p11prov_rsasig_digest_sign_init(void *ctx, const char *digest,
     }
 
     sigctx->digest_op = true;
+
+    if (!OSSL_PARAM_locate_const(params, OSSL_SIGNATURE_PARAM_PAD_MODE)
+        && p11prov_obj_is_rsa_pss(sigctx->key)) {
+        sigctx->mechtype = CKM_RSA_PKCS_PSS;
+    }
 
     return p11prov_rsasig_set_ctx_params(ctx, params);
 }

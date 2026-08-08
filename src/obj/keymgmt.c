@@ -3,17 +3,81 @@
 
 #include "obj/internal.h"
 
+/* Fetch CKA_ALLOWED_MECHANISMS from the token when it is not already cached
+ * on the object, and cache the result.  Returns a pointer to the cached
+ * attribute on success, NULL if the attribute is absent or unsupported. */
+static CK_ATTRIBUTE *get_or_fetch_allowed_mechs(P11PROV_OBJ *obj)
+{
+    CK_ATTRIBUTE *am;
+
+    am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
+    if (am && am->ulValueLen > 0) return am;
+
+    /* CKA_ALLOWED_MECHANISMS is sensitive on private keys (CKA_SENSITIVE).
+     * The public key object holds a readable copy — read from it instead
+     * and cache the result on the original (obj) so subsequent calls on
+     * either key find it. */
+    P11PROV_OBJ *pub = obj;
+    P11PROV_OBJ *free_me = NULL;
+    if (obj->class == CKO_PRIVATE_KEY) {
+        pub = p11prov_obj_find_associated(obj, CKO_PUBLIC_KEY);
+        if (!pub) return NULL;
+        free_me = pub;
+    }
+    if (pub->class != CKO_PUBLIC_KEY && pub->class != CKO_PRIVATE_KEY) {
+        if (free_me) p11prov_obj_free(free_me);
+        return NULL;
+    }
+
+    CK_OBJECT_HANDLE h = p11prov_obj_get_handle(pub);
+    if (h == CK_INVALID_HANDLE) {
+        if (free_me) p11prov_obj_free(free_me);
+        return NULL;
+    }
+
+    P11PROV_SESSION *session = NULL;
+    CK_RV ret = p11prov_try_session_ref(pub, 0, false, false, &session);
+    if (ret != CKR_OK) {
+        if (free_me) p11prov_obj_free(free_me);
+        return NULL;
+    }
+
+    CK_SESSION_HANDLE sh = p11prov_session_handle(session);
+    CK_ATTRIBUTE attr = { CKA_ALLOWED_MECHANISMS, NULL, 0 };
+    p11prov_set_error_mark(pub->ctx);
+    ret = p11prov_GetAttributeValue(pub->ctx, sh, h, &attr, 1);
+    if ((ret == CKR_OK || ret == CKR_ATTRIBUTE_TYPE_INVALID)
+        && attr.ulValueLen > 0
+        && attr.ulValueLen != CK_UNAVAILABLE_INFORMATION) {
+        attr.pValue = OPENSSL_malloc(attr.ulValueLen);
+        if (attr.pValue) {
+            ret = p11prov_GetAttributeValue(pub->ctx, sh, h, &attr, 1);
+            if (ret == CKR_OK) {
+                p11prov_obj_add_attr(obj, &attr);
+                attr.pValue = NULL;
+                p11prov_pop_error_to_mark(pub->ctx);
+                p11prov_return_session(session);
+                if (free_me) p11prov_obj_free(free_me);
+                am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
+                return (am && am->ulValueLen > 0) ? am : NULL;
+            }
+            OPENSSL_free(attr.pValue);
+        }
+    }
+    p11prov_clear_last_error_mark(pub->ctx);
+    p11prov_return_session(session);
+    if (free_me) p11prov_obj_free(free_me);
+    return NULL;
+}
+
 bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
 {
     CK_BBOOL token_supports_allowed_mechs = CK_TRUE;
     CK_ATTRIBUTE *am = NULL;
     CK_MECHANISM_TYPE *allowed;
-    P11PROV_OBJ *priv = NULL;
     int am_nmechs;
     CK_RV ret;
 
-    /* If the token does not support this attribute, do not even try to figure
-     * out the subtype. */
     ret = p11prov_token_sup_attr(obj->ctx, obj->slotid, GET_ATTR,
                                  CKA_ALLOWED_MECHANISMS,
                                  &token_supports_allowed_mechs);
@@ -23,31 +87,11 @@ bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
         return false;
     }
 
-    am = p11prov_obj_get_attr(obj, CKA_ALLOWED_MECHANISMS);
-    if (am == NULL || am->ulValueLen == 0) {
-        /* The ALLOWED_MECHANISMS should be on both of the keys. But more
-         * commonly they are available only on the private key. Check if we
-         * have a priv key associated to this pub key and if so, use that one.
-         * TODO we can try also certificate restrictions
-         */
-        if (obj->class == CKO_PRIVATE_KEY) {
-            /* no limitations */
-            return false;
-        }
-
-        /* Try to find private key */
-        priv = p11prov_obj_find_associated(obj, CKO_PRIVATE_KEY);
-        if (priv == NULL) {
-            return false;
-        }
-
-        am = p11prov_obj_get_attr(priv, CKA_ALLOWED_MECHANISMS);
-        if (am == NULL || am->ulValueLen == 0) {
-            /* no limitations */
-            p11prov_obj_free(priv);
-            return false;
-        }
+    am = get_or_fetch_allowed_mechs(obj);
+    if (!am || am->ulValueLen == 0) {
+        return false;
     }
+
     allowed = (CK_MECHANISM_TYPE *)am->pValue;
     am_nmechs = am->ulValueLen / sizeof(CK_MECHANISM_TYPE);
     for (int i = 0; i < am_nmechs; i++) {
@@ -59,14 +103,9 @@ bool p11prov_obj_is_rsa_pss(P11PROV_OBJ *obj)
             }
         }
         if (!found) {
-            /* this is not a RSA-PSS mechanism. We can not enforce any
-             * limitations */
-            p11prov_obj_free(priv);
             return false;
         }
     }
-    /* all allowed mechanisms fit into the list of RSA-PSS ones */
-    p11prov_obj_free(priv);
     return true;
 }
 

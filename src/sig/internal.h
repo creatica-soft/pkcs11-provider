@@ -78,6 +78,7 @@ int p11prov_sig_digest_update(P11PROV_SIG_CTX *sigctx, unsigned char *data,
                               size_t datalen);
 int p11prov_sig_digest_final(P11PROV_SIG_CTX *sigctx, unsigned char *sig,
                              size_t *siglen, size_t sigsize);
+CK_RV p11prov_rsasig_set_mechanism(P11PROV_SIG_CTX *sigctx);
 
 #define DER_SEQUENCE 0x30
 #define DER_OBJECT 0x06
